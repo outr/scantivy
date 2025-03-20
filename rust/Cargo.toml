@@ -1,0 +1,12 @@
+[package]
+name = "scantivy"
+version = "0.1.0-SNAPSHOT"
+edition = "2024"
+
+[dependencies]
+tantivy = "0.22.0"
+libc = "0.2.171"
+lazy_static = "1.5.0"
+
+[lib]
+crate-type = ["cdylib"]
