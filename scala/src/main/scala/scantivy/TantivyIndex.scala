@@ -101,7 +101,10 @@ object NativeLibLoader {
   def extractLibrary(): Unit = {
     val libName = System.getProperty("os.name").toLowerCase match {
       case os if os.contains("win") => "scantivy.dll"
-      case os if os.contains("mac") => "libscantivy.dylib"
+      case os if os.contains("mac") => System.getProperty("os.arch") match {
+        case arch if arch.contains("aarch64") || arch.contains("arm64") => "libscantivy-aarch64.dylib"
+        case _ => "libscantivy-x86_64.dylib"
+      }
       case _ => "libscantivy.so"
     }
 
