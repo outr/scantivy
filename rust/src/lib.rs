@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tantivy::collector::TopDocs;
 use tantivy::directory::MmapDirectory;
-use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
+use tantivy::query::{AllQuery, BooleanQuery, Occur, Query, TermQuery};
 use tantivy::schema::*;
 use tantivy::{Index, TantivyDocument, Term};
 
@@ -24,7 +24,7 @@ pub extern "C" fn create_index(path: *const c_char) -> *mut c_char {
     let schema = {
         let mut schema_builder = Schema::builder();
         schema_builder.add_text_field("title", TEXT | STORED);
-        schema_builder.add_facet_field("category", FacetOptions::default());
+        schema_builder.add_facet_field("category", FacetOptions::default().set_stored()); // ✅ STORE FACETS
         schema_builder.build()
     };
 
@@ -114,7 +114,9 @@ pub extern "C" fn search(index_id: *const c_char, query: *const c_char, facet: *
     }
 
     // Combine queries using BooleanQuery
-    let combined_query: Box<dyn Query> = if queries.len() == 1 {
+    let combined_query: Box<dyn Query> = if queries.is_empty() {
+        Box::new(AllQuery) // ✅ Use AllQuery if no filters are present
+    } else if queries.len() == 1 {
         queries.remove(0).1
     } else {
         Box::new(BooleanQuery::new(queries))
@@ -126,6 +128,7 @@ pub extern "C" fn search(index_id: *const c_char, query: *const c_char, facet: *
 
     for (_score, doc_address) in top_docs {
         let retrieved_doc: TantivyDocument = searcher.doc(doc_address).unwrap();
+        println!("DEBUG: Retrieved Doc: {:?}", retrieved_doc); // ✅ Print full document
         results.push(format!("{:?}", retrieved_doc));
     }
 
