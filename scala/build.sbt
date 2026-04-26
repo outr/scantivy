@@ -1,6 +1,8 @@
 name := "scantivy"
 organization := "com.outr"
-version := "1.0.0"
+// `version` is derived from the git tag by sbt-dynver — see project/plugins.sbt. Tagged commits
+// (`v1.0.0`, `v1.0.0-rc1`, ...) get clean release versions; untagged or dirty workspaces get
+// `<last-tag>+<commits-ahead>-<sha>[+DIRTY]-SNAPSHOT`.
 
 scalaVersion := "3.8.3"
 

@@ -11,26 +11,26 @@ GitHub repository secrets must be set:
 - `SONATYPE_USERNAME` — Sonatype Central token username
 - `SONATYPE_PASSWORD` — Sonatype Central token password
 
-Both `Cargo.toml` and `build.sbt` must declare the same version string. Currently both are at
-`1.0.0`.
+**Version sources of truth:**
+- **Scala / published artifact:** derived automatically from the git tag by [sbt-dynver](https://github.com/sbt/sbt-dynver). Tag `v1.2.3` → published version `1.2.3`. No manual bump needed.
+- **`rust/Cargo.toml`:** manually maintained. Must equal the tag (without the `v` prefix). The release workflow guards against drift and refuses to publish on mismatch.
 
 ## Recommended pre-flight: dry-run with an rc tag
 
-The publish pipeline has never run end-to-end. Before tagging the final release, dry-run with an
-rc:
+Before tagging the final release, dry-run with an rc:
 
 ```bash
-# 1. Bump both versions to a release-candidate.
-sed -i 's/^version = "1.0.0"$/version = "1.0.0-rc1"/' rust/Cargo.toml
-sed -i 's/^version := "1.0.0"$/version := "1.0.0-rc1"/' scala/build.sbt
+# 1. Bump Cargo.toml to the rc version (build.sbt has no `version :=` line — sbt-dynver
+#    derives it from the tag).
+sed -i 's/^version = ".*"$/version = "1.0.0-rc1"/' rust/Cargo.toml
 
 # 2. Commit and push the bump.
-git add rust/Cargo.toml scala/build.sbt
+git add rust/Cargo.toml
 git commit -m "rc1"
 git push
 
 # 3. Tag and push.
-git tag v1.0.0-rc1
+git tag -a v1.0.0-rc1 -m "v1.0.0-rc1"
 git push origin v1.0.0-rc1
 ```
 
@@ -50,15 +50,14 @@ run a quick smoke test on each platform you care about.
 Once the rc validates:
 
 ```bash
-# 1. Bump back to the final version.
-sed -i 's/^version = "1.0.0-rc1"$/version = "1.0.0"/' rust/Cargo.toml
-sed -i 's/^version := "1.0.0-rc1"$/version := "1.0.0"/' scala/build.sbt
+# 1. Bump Cargo.toml to the final version.
+sed -i 's/^version = ".*"$/version = "1.0.0"/' rust/Cargo.toml
 
 # 2. Commit, push, tag.
-git add rust/Cargo.toml scala/build.sbt
+git add rust/Cargo.toml
 git commit -m "Release 1.0.0"
 git push
-git tag v1.0.0
+git tag -a v1.0.0 -m "v1.0.0"
 git push origin v1.0.0
 ```
 
@@ -83,4 +82,7 @@ All four must pass before pushing a release tag.
 ## After release
 
 1. Update `CHANGELOG.md` with the released version's date if it wasn't already correct.
-2. Bump versions to the next `-SNAPSHOT` so subsequent commits target the next release.
+2. Leave `Cargo.toml`'s version at the just-released number — sbt-dynver on the Scala side
+   automatically reports `<version>+<commits-ahead>-<sha>-SNAPSHOT` for post-release commits, and
+   Cargo.toml is internal-only (the crate isn't published to crates.io), so a static "current
+   major" placeholder is fine. Bump it again as part of the next release commit.
