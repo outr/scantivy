@@ -1,5 +1,10 @@
 # Scantivy
 
+[![Maven Central](https://img.shields.io/maven-central/v/com.outr/scantivy_3.svg)](https://central.sonatype.com/artifact/com.outr/scantivy_3)
+[![CI](https://github.com/outr/scantivy/actions/workflows/ci.yml/badge.svg)](https://github.com/outr/scantivy/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Java 22+](https://img.shields.io/badge/java-22%2B-orange.svg)](https://openjdk.org/projects/jdk/22/)
+
 A Scala 3 wrapper around [Tantivy](https://github.com/quickwit-oss/tantivy), Rust's full-text search engine. The Rust side is compiled as a `cdylib` and the Scala side talks to it over a protobuf-encoded FFI using the JEP 442 Foreign Function & Memory API.
 
 ## Requirements
