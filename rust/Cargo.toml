@@ -24,6 +24,10 @@ crate-type = ["cdylib"]
 
 [build-dependencies]
 prost-build = "0.14"
+# Vendors a static protoc binary for the build host so we don't depend on it being installed
+# in CI runners or `cross` Docker images. ~5MB added to clean-build artifacts; a no-op on
+# subsequent incremental builds.
+protoc-bin-vendored = "3"
 
 [profile.release]
 lto = "thin"
