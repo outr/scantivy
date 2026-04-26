@@ -54,11 +54,14 @@ lazy val nativeLibName: String = nativeOs match {
 }
 
 // Local-dev convenience: copy lib/libscantivy.* into /native/<os>-<arch>/ inside the jar so the
-// loader finds it. CI release builds skip this and instead drop pre-built libs for ALL targets
-// directly into src/main/resources/native/<os>-<arch>/ before packaging.
+// loader finds it. CI release builds drop pre-built libs for ALL targets directly into
+// src/main/resources/native/<os>-<arch>/ before packaging, so the resource is already present —
+// in that case we skip this task to avoid a "Duplicate mappings" failure during packageBin.
 Compile / resourceGenerators += Def.task {
   val src = baseDirectory.value / "lib" / nativeLibName
-  if (src.exists()) {
+  val staged = baseDirectory.value / "src" / "main" / "resources" / "native" /
+    s"$nativeOs-$nativeArch" / nativeLibName
+  if (src.exists() && !staged.exists()) {
     val outDir = (Compile / resourceManaged).value / "native" / s"$nativeOs-$nativeArch"
     outDir.mkdirs()
     val dest = outDir / nativeLibName

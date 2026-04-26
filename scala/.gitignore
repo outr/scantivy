@@ -1,3 +1,10 @@
 .bsp/
 .idea/
 target/
+
+# Host-specific native libs — local dev drops them here for `sbt test`, but they should never
+# be checked in. The Release workflow builds them per-platform via the matrix and stages them
+# directly into src/main/resources/native/<os>-<arch>/.
+lib/*.so
+lib/*.dylib
+lib/*.dll
