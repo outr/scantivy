@@ -17,6 +17,10 @@ pub struct ResolvedSchema {
     pub text_fields: Vec<Field>,
     /// All FACET-kind fields (for facet-collector setup).
     pub facet_fields: HashSet<Field>,
+    /// The schema's configured id field. Mirrors `IndexHandle::id_field` but lives here so the
+    /// query/search compile paths (which only take `&ResolvedSchema`) can resolve docs by id for
+    /// features like `MoreLikeThis` and `explain`.
+    pub id_field: Option<String>,
 }
 
 impl ResolvedSchema {
@@ -68,6 +72,7 @@ pub fn build_schema(def: &pb::SchemaDef) -> Result<ResolvedSchema> {
         kinds,
         text_fields,
         facet_fields,
+        id_field: None,
     })
 }
 

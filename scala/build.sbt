@@ -1,6 +1,6 @@
 name := "scantivy"
 organization := "com.outr"
-version := "1.0.0-SNAPSHOT"
+version := "1.0.0"
 
 scalaVersion := "3.8.3"
 

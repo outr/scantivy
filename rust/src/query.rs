@@ -7,8 +7,9 @@ use crate::schema::ResolvedSchema;
 use regex::escape as regex_escape;
 use std::ops::Bound;
 use tantivy::query::{
-    AllQuery, BooleanQuery, BoostQuery, EmptyQuery, Occur, PhraseQuery, Query, QueryParser,
-    RangeQuery, RegexQuery, TermQuery, TermSetQuery,
+    AllQuery, BooleanQuery, BoostQuery, ConstScoreQuery, DisjunctionMaxQuery, EmptyQuery,
+    ExistsQuery, FuzzyTermQuery, MoreLikeThisQuery, Occur, PhrasePrefixQuery, PhraseQuery, Query,
+    QueryParser, RangeQuery, RegexQuery, TermQuery, TermSetQuery,
 };
 use tantivy::schema::{Facet, FieldType, IndexRecordOption};
 use tantivy::{Index, Term};
@@ -46,6 +47,27 @@ pub fn compile(
         pb::query::Node::Phrase(p) => compile_phrase(schema, p)?,
         pb::query::Node::DrillDown(d) => compile_drill_down(schema, d)?,
         pb::query::Node::BoolQuery(b) => compile_bool(index, schema, b)?,
+        pb::query::Node::Exists(e) => Box::new(ExistsQuery::new(e.field.clone(), false)),
+        pb::query::Node::Fuzzy(f) => compile_fuzzy(schema, f)?,
+        pb::query::Node::PhrasePrefix(p) => compile_phrase_prefix(schema, p)?,
+        pb::query::Node::Boost(b) => {
+            let inner = b
+                .inner
+                .as_ref()
+                .ok_or_else(|| ScantivyError::UnsupportedQuery("boost: missing inner".into()))?;
+            Box::new(BoostQuery::new(compile(index, schema, inner)?, b.factor))
+        }
+        pb::query::Node::DisjunctionMax(d) => compile_disjunction_max(index, schema, d)?,
+        pb::query::Node::ConstScore(c) => {
+            let inner = c.inner.as_ref().ok_or_else(|| {
+                ScantivyError::UnsupportedQuery("const_score: missing inner".into())
+            })?;
+            Box::new(ConstScoreQuery::new(
+                compile(index, schema, inner)?,
+                c.score,
+            ))
+        }
+        pb::query::Node::MoreLikeThis(m) => compile_more_like_this(index, schema, m)?,
     })
 }
 
@@ -233,7 +255,142 @@ fn compile_bool(
     Ok(Box::new(bq))
 }
 
-#[allow(dead_code)]
-fn _unused() {
-    let _ = BoostQuery::new(Box::new(AllQuery), 1.0); // keep import live for future scoring tweaks
+fn compile_fuzzy(schema: &ResolvedSchema, f: &pb::QueryFuzzy) -> Result<Box<dyn Query>> {
+    let field = schema.field(&f.field)?;
+    let term = Term::from_field_text(field, &f.value);
+    let distance = f.distance.min(255) as u8;
+    Ok(if f.prefix {
+        Box::new(FuzzyTermQuery::new_prefix(
+            term,
+            distance,
+            f.transposition_cost_one,
+        ))
+    } else {
+        Box::new(FuzzyTermQuery::new(
+            term,
+            distance,
+            f.transposition_cost_one,
+        ))
+    })
+}
+
+fn compile_phrase_prefix(
+    schema: &ResolvedSchema,
+    p: &pb::QueryPhrasePrefix,
+) -> Result<Box<dyn Query>> {
+    let field = schema.field(&p.field)?;
+    if p.terms.is_empty() {
+        return Ok(Box::new(EmptyQuery));
+    }
+    let terms: Vec<Term> = p
+        .terms
+        .iter()
+        .map(|t| Term::from_field_text(field, t))
+        .collect();
+    let mut q = PhrasePrefixQuery::new(terms);
+    if let Some(max) = p.max_expansions {
+        q.set_max_expansions(max);
+    }
+    Ok(Box::new(q))
+}
+
+fn compile_disjunction_max(
+    index: &Index,
+    schema: &ResolvedSchema,
+    d: &pb::QueryDisjunctionMax,
+) -> Result<Box<dyn Query>> {
+    if d.disjuncts.is_empty() {
+        return Ok(Box::new(EmptyQuery));
+    }
+    let mut compiled: Vec<Box<dyn Query>> = Vec::with_capacity(d.disjuncts.len());
+    for q in &d.disjuncts {
+        compiled.push(compile(index, schema, q)?);
+    }
+    Ok(match d.tie_breaker {
+        Some(tb) => Box::new(DisjunctionMaxQuery::with_tie_breaker(compiled, tb)),
+        None => Box::new(DisjunctionMaxQuery::new(compiled)),
+    })
+}
+
+/// Resolve a doc by its id-field value, returning the first matching `DocAddress` or `None`.
+pub fn lookup_doc_by_id(
+    index: &Index,
+    schema: &ResolvedSchema,
+    id_field: &str,
+    source_id: &str,
+) -> Result<Option<tantivy::DocAddress>> {
+    use tantivy::collector::TopDocs;
+    let field = schema.field(id_field)?;
+    let term = Term::from_field_text(field, source_id);
+    let q = TermQuery::new(term, IndexRecordOption::Basic);
+    let reader = index
+        .reader_builder()
+        .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
+        .try_into()?;
+    let searcher = reader.searcher();
+    let top: Vec<(f32, tantivy::DocAddress)> =
+        searcher.search(&q, &TopDocs::with_limit(1).order_by_score())?;
+    Ok(top.into_iter().next().map(|(_, addr)| addr))
+}
+
+fn compile_more_like_this(
+    index: &Index,
+    schema: &ResolvedSchema,
+    m: &pb::QueryMoreLikeThis,
+) -> Result<Box<dyn Query>> {
+    let id_field = schema.id_field.as_deref().ok_or_else(|| {
+        ScantivyError::UnsupportedQuery(
+            "more_like_this requires the schema to declare an id_field".into(),
+        )
+    })?;
+    let addr = lookup_doc_by_id(index, schema, id_field, &m.source_id)?.ok_or_else(|| {
+        ScantivyError::UnsupportedQuery(format!(
+            "more_like_this: no doc with {}='{}'",
+            id_field, m.source_id
+        ))
+    })?;
+
+    let mut builder = MoreLikeThisQuery::builder();
+    if let Some(v) = m.min_doc_frequency {
+        builder = builder.with_min_doc_frequency(v);
+    }
+    if let Some(v) = m.max_doc_frequency {
+        builder = builder.with_max_doc_frequency(v);
+    }
+    if let Some(v) = m.min_term_frequency {
+        builder = builder.with_min_term_frequency(v as usize);
+    }
+    if let Some(v) = m.max_query_terms {
+        builder = builder.with_max_query_terms(v as usize);
+    }
+    if let Some(v) = m.min_word_length {
+        builder = builder.with_min_word_length(v as usize);
+    }
+    if let Some(v) = m.max_word_length {
+        builder = builder.with_max_word_length(v as usize);
+    }
+    if let Some(v) = m.boost_factor {
+        builder = builder.with_boost_factor(v);
+    }
+    if !m.stop_words.is_empty() {
+        builder = builder.with_stop_words(m.stop_words.clone());
+    }
+    let mlt: Box<dyn Query> = Box::new(builder.with_document(addr));
+
+    // Tantivy's MoreLikeThis ranks the source doc itself at the top by default, which is rarely
+    // what callers actually want. Wrap the MLT query in a BooleanQuery that excludes the source
+    // by id-field term unless the caller explicitly opted in.
+    let exclude = m.exclude_source.unwrap_or(true);
+    if !exclude {
+        return Ok(mlt);
+    }
+    let id_field_handle = schema.field(id_field)?;
+    let exclude_term = TermQuery::new(
+        Term::from_field_text(id_field_handle, &m.source_id),
+        IndexRecordOption::Basic,
+    );
+    Ok(Box::new(BooleanQuery::new(vec![
+        (Occur::Must, mlt),
+        (Occur::MustNot, Box::new(exclude_term)),
+    ])))
 }

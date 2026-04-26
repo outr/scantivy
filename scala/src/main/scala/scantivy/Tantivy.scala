@@ -6,7 +6,17 @@ import java.lang.invoke.MethodHandle
 import scalapb.GeneratedMessage
 import scala.util.Using
 
-/** Entry point for creating and reattaching to Tantivy indexes. */
+/** Entry point for creating and reattaching to Tantivy indexes.
+ *
+ *  Two ways to construct an index:
+ *  - [[create]] — build a new index from a [[pb.CreateIndexRequest]]. If `request.path` is set,
+ *    the index is persisted on disk and can be reopened later with [[open]]; otherwise it lives
+ *    in memory only and disappears with the JVM.
+ *  - [[open]] — reattach to an existing on-disk index produced by an earlier `create`.
+ *
+ *  Both return `Either[String, TantivyIndex]`. The handle is thread-safe and shareable; close it
+ *  via [[TantivyIndex.close]] when done so the Rust-side registry can drop it.
+ */
 object Tantivy {
   // Force the loader to extract / locate the lib eagerly so that link errors surface here rather
   // than on the first call to a downstream op.
@@ -14,6 +24,10 @@ object Tantivy {
 
   /** Create a new index. If `request.path` is set, the index is persisted on disk; otherwise it
    *  lives in memory only.
+   *
+   *  Returns `Left` for schema errors (missing field name, unsupported field kind), IO errors
+   *  (couldn't create the on-disk directory, couldn't open MmapDirectory), or Tantivy-internal
+   *  failures during writer/reader construction.
    */
   def create(request: pb.CreateIndexRequest): Either[String, TantivyIndex] = {
     val resp = Ffi.call(request, TantivyLib.createIndex)(pb.CreateIndexResponse.parseFrom)
@@ -26,9 +40,14 @@ object Tantivy {
     })
   }
 
-  /** Reattach to an on-disk index. Throws if the path does not exist or has no Tantivy index. */
-  def open(path: String): Either[String, TantivyIndex] = {
-    val req = pb.OpenIndexRequest(path = path)
+  /** Reattach to an on-disk index.
+   *
+   *  `idField` re-establishes the schema's id field — Tantivy's on-disk format does not persist it,
+   *  so reopening without it disables `upsert` / `delete(idValue)` / `MoreLikeThis` / `explain`.
+   *  Leave unset for read-only / search-only usage.
+   */
+  def open(path: String, idField: Option[String] = None): Either[String, TantivyIndex] = {
+    val req = pb.OpenIndexRequest(path = path, idField = idField)
     val resp = Ffi.call(req, TantivyLib.openIndex)(pb.CreateIndexResponse.parseFrom)
     resp.flatMap(r => r.error match {
       case Some(e) => Left(e)

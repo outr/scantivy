@@ -55,6 +55,7 @@ object TantivyLib {
   val search:    MethodHandle = link("search", opDesc)
   val aggregate: MethodHandle = link("aggregate", opDesc)
   val distinct:  MethodHandle = link("distinct", opDesc)
+  val explain:   MethodHandle = link("explain", opDesc)
 
   // -- buffer mgmt --------------------------------------------------------------------------
   val freeBuffer: MethodHandle = link("free_buffer", freeDesc)

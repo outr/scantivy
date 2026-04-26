@@ -1,6 +1,6 @@
 [package]
 name = "scantivy"
-version = "1.0.0-SNAPSHOT"
+version = "1.0.0"
 edition = "2024"
 
 [dependencies]
@@ -8,13 +8,16 @@ tantivy = "0.26"
 parking_lot = "0.12"
 regex = "1"
 prost = "0.14"
-prost-types = "0.14"
-bytes = "1.8"
 thiserror = "2"
 sha2 = "0.11"
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
 serde_json = "1"
+# Tantivy emits diagnostics via the `log` crate. We initialize env_logger lazily on first index
+# creation so consumers can surface them with `RUST_LOG=tantivy=info` (or similar) without doing
+# anything in the JVM-side application.
+env_logger = "0.11"
+log = "0.4"
 
 [lib]
 crate-type = ["cdylib"]

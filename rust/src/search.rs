@@ -9,9 +9,13 @@ use std::collections::VecDeque;
 use tantivy::collector::{
     Collector, Count, FacetCollector, MultiCollector, SegmentCollector, TopDocs,
 };
+use tantivy::columnar::{Column, StrColumn};
 use tantivy::query::{AllQuery, Query};
 use tantivy::schema::FieldType;
-use tantivy::{DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader, TantivyDocument};
+use tantivy::snippet::SnippetGenerator;
+use tantivy::{
+    DateTime, DocAddress, DocId, Order, Score, SegmentOrdinal, SegmentReader, TantivyDocument,
+};
 
 pub fn search(handle: &IndexHandle, req: &pb::SearchRequest) -> Result<pb::SearchResponse> {
     let q: Box<dyn Query> = match req.query.as_ref() {
@@ -25,46 +29,50 @@ pub fn search(handle: &IndexHandle, req: &pb::SearchRequest) -> Result<pb::Searc
     let offset = req.offset as usize;
     let max_docs = limit.saturating_add(offset);
 
-    let sort = req.sort.first().and_then(|s| s.clause.clone());
-
-    // Run the top-N search; for sort-by-fast-field this produces (Option<...>, DocAddress) so we
-    // discard the field value and treat score as 0 for downstream uniformity.
-    let scored: Vec<(Score, DocAddress)> = match &sort {
-        None => searcher.search(&q, &TopDocs::with_limit(max_docs).order_by_score())?,
-        Some(pb::sort_clause::Clause::Relevance(r)) => {
-            let docs = searcher.search(&q, &TopDocs::with_limit(max_docs).order_by_score())?;
-            if matches!(
-                pb::SortDirection::try_from(r.direction),
-                Ok(pb::SortDirection::SortAsc)
-            ) {
-                let mut v = docs;
-                v.reverse();
-                v
-            } else {
-                docs
+    // Multi-key sort runs through a custom collector that keeps a tuple of sort values per doc.
+    // For 0- and 1-key requests we keep the existing TopDocs fast paths, since Tantivy's heap-based
+    // collectors are meaningfully cheaper than the collect-and-sort approach the multi-key path uses.
+    let scored: Vec<(Score, DocAddress)> = if req.sort.len() <= 1 {
+        let sort = req.sort.first().and_then(|s| s.clause.clone());
+        match &sort {
+            None => searcher.search(&q, &TopDocs::with_limit(max_docs).order_by_score())?,
+            Some(pb::sort_clause::Clause::Relevance(r)) => {
+                let docs = searcher.search(&q, &TopDocs::with_limit(max_docs).order_by_score())?;
+                if matches!(
+                    pb::SortDirection::try_from(r.direction),
+                    Ok(pb::SortDirection::SortAsc)
+                ) {
+                    let mut v = docs;
+                    v.reverse();
+                    v
+                } else {
+                    docs
+                }
+            }
+            Some(pb::sort_clause::Clause::IndexOrder(io)) => {
+                let descending = matches!(
+                    pb::SortDirection::try_from(io.direction),
+                    Ok(pb::SortDirection::SortDesc)
+                );
+                let addrs: Vec<DocAddress> = searcher.search(
+                    &q,
+                    &IndexOrderCollector {
+                        limit: max_docs,
+                        descending,
+                    },
+                )?;
+                addrs.into_iter().map(|a| (0.0_f32, a)).collect()
+            }
+            Some(pb::sort_clause::Clause::ByField(by)) => {
+                let order = match pb::SortDirection::try_from(by.direction) {
+                    Ok(pb::SortDirection::SortAsc) => Order::Asc,
+                    _ => Order::Desc,
+                };
+                sort_by_fast_field(handle, q.as_ref(), &searcher, &by.field, order, max_docs)?
             }
         }
-        Some(pb::sort_clause::Clause::IndexOrder(io)) => {
-            let descending = matches!(
-                pb::SortDirection::try_from(io.direction),
-                Ok(pb::SortDirection::SortDesc)
-            );
-            let addrs: Vec<DocAddress> = searcher.search(
-                &q,
-                &IndexOrderCollector {
-                    limit: max_docs,
-                    descending,
-                },
-            )?;
-            addrs.into_iter().map(|a| (0.0_f32, a)).collect()
-        }
-        Some(pb::sort_clause::Clause::ByField(by)) => {
-            let order = match pb::SortDirection::try_from(by.direction) {
-                Ok(pb::SortDirection::SortAsc) => Order::Asc,
-                _ => Order::Desc,
-            };
-            sort_by_fast_field(handle, q.as_ref(), &searcher, &by.field, order, max_docs)?
-        }
+    } else {
+        multi_sort_search(handle, q.as_ref(), &searcher, &req.sort, max_docs)?
     };
 
     // Total count via a separate pass (cheap on Tantivy's Count collector).
@@ -81,6 +89,11 @@ pub fn search(handle: &IndexHandle, req: &pb::SearchRequest) -> Result<pb::Searc
         Vec::new()
     };
 
+    // Snippet generators are query-scoped, not doc-scoped — build one per requested field, reuse
+    // across hits.
+    let snippet_generators =
+        build_snippet_generators(handle, q.as_ref(), &searcher, &req.snippets)?;
+
     let mut hits: Vec<pb::SearchHit> = Vec::with_capacity(limit);
     for (score, addr) in scored.into_iter().skip(offset).take(limit) {
         if let Some(min) = req.min_doc_score
@@ -94,10 +107,12 @@ pub fn search(handle: &IndexHandle, req: &pb::SearchRequest) -> Result<pb::Searc
             .as_deref()
             .and_then(|name| extract_id_string(handle, &doc, name).ok());
         let payload = build_payload(handle, &doc, req)?;
+        let snippets = render_snippets(&snippet_generators, &doc);
         hits.push(pb::SearchHit {
             payload: Some(payload),
             score: if req.score_docs { Some(score) } else { None },
             id: id_value,
+            snippets,
         });
     }
 
@@ -353,6 +368,45 @@ fn value_to_json(v: &pb::Value) -> serde_json::Value {
     }
 }
 
+/// Build one [`SnippetGenerator`] per requested spec. Generators are query-scoped, so we set them
+/// up once and reuse across hits.
+fn build_snippet_generators(
+    handle: &IndexHandle,
+    q: &dyn Query,
+    searcher: &tantivy::Searcher,
+    specs: &[pb::SnippetSpec],
+) -> Result<Vec<(pb::SnippetSpec, SnippetGenerator)>> {
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let field = handle.schema.field(&spec.field)?;
+        let mut snippet_gen = SnippetGenerator::create(searcher, q, field)?;
+        if let Some(max) = spec.max_num_chars {
+            snippet_gen.set_max_num_chars(max as usize);
+        }
+        out.push((spec.clone(), snippet_gen));
+    }
+    Ok(out)
+}
+
+fn render_snippets(
+    generators: &[(pb::SnippetSpec, SnippetGenerator)],
+    doc: &TantivyDocument,
+) -> Vec<pb::SnippetResult> {
+    generators
+        .iter()
+        .map(|(spec, snippet_gen)| {
+            let mut snippet = snippet_gen.snippet_from_doc(doc);
+            let pre = spec.pre_tag.as_deref().unwrap_or("<b>");
+            let post = spec.post_tag.as_deref().unwrap_or("</b>");
+            snippet.set_snippet_prefix_postfix(pre, post);
+            pb::SnippetResult {
+                field: spec.field.clone(),
+                fragment: snippet.to_html(),
+            }
+        })
+        .collect()
+}
+
 pub fn count(handle: &IndexHandle, req: &pb::CountRequest) -> Result<u64> {
     let q = match req.query.as_ref() {
         Some(q) => compile(&handle.index, &handle.schema, q)?,
@@ -362,6 +416,32 @@ pub fn count(handle: &IndexHandle, req: &pb::CountRequest) -> Result<u64> {
     let searcher = handle.reader.searcher();
     let n = searcher.search(&q, &Count)?;
     Ok(n as u64)
+}
+
+pub fn explain(handle: &IndexHandle, req: &pb::ExplainRequest) -> Result<pb::ExplainResponse> {
+    let q = req
+        .query
+        .as_ref()
+        .ok_or_else(|| ScantivyError::UnsupportedQuery("explain: missing query".into()))?;
+    let compiled = compile(&handle.index, &handle.schema, q)?;
+    let id_field = handle.schema.id_field.as_deref().ok_or_else(|| {
+        ScantivyError::UnsupportedQuery("explain: schema must declare an id_field".into())
+    })?;
+    handle.reader.reload().ok();
+    let searcher = handle.reader.searcher();
+    match crate::query::lookup_doc_by_id(&handle.index, &handle.schema, id_field, &req.source_id)? {
+        None => Ok(pb::ExplainResponse {
+            explanation: String::new(),
+            error: None,
+        }),
+        Some(addr) => {
+            let explanation = compiled.explain(&searcher, addr)?;
+            Ok(pb::ExplainResponse {
+                explanation: explanation.to_pretty_json(),
+                error: None,
+            })
+        }
+    }
 }
 
 /// Collector that yields matching docs in index order (segment ordinal, then DocId).
@@ -445,5 +525,285 @@ impl SegmentCollector for SegIndexOrderCollector {
             Box::new(self.docs.into_iter())
         };
         docs.map(|d| DocAddress::new(segment_ord, d)).collect()
+    }
+}
+
+// ============================================================================================
+// Multi-key sort
+// ============================================================================================
+
+/// Per-key kind, resolved at query-build time from the schema. Each variant carries the field
+/// name (for ByField kinds) so `for_segment` can look up the appropriate fast-field reader.
+#[derive(Clone, Debug)]
+enum KeyKind {
+    Score,
+    IndexOrder,
+    I64(String),
+    U64(String),
+    F64(String),
+    Bool(String),
+    Date(String),
+    Str(String),
+}
+
+/// Sort value for a single doc on a single key. Cross-kind comparisons never happen because all
+/// docs in one search use the same key sequence; `None` represents a missing field value and is
+/// ordered before every present value (so ascending sorts surface missing fields first).
+///
+/// Note on `Str`: Tantivy's str fast fields use *per-segment* term ordinals, so we have to
+/// materialize the actual string here to get a globally-consistent comparison across segments.
+#[derive(Clone, Debug)]
+enum SortKeyValue {
+    None,
+    F32(f32),
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Bool(bool),
+    Str(String),
+    Pos(u64),
+}
+
+fn cmp_value(a: &SortKeyValue, b: &SortKeyValue) -> std::cmp::Ordering {
+    use SortKeyValue::*;
+    use std::cmp::Ordering::*;
+    match (a, b) {
+        (None, None) => Equal,
+        (None, _) => Less,
+        (_, None) => Greater,
+        (F32(x), F32(y)) => x.partial_cmp(y).unwrap_or(Equal),
+        (I64(x), I64(y)) => x.cmp(y),
+        (U64(x), U64(y)) => x.cmp(y),
+        (F64(x), F64(y)) => x.partial_cmp(y).unwrap_or(Equal),
+        (Bool(x), Bool(y)) => x.cmp(y),
+        (Str(x), Str(y)) => x.cmp(y),
+        (Pos(x), Pos(y)) => x.cmp(y),
+        // Mixed kinds shouldn't occur — all docs in one search produce the same key sequence —
+        // but we degrade gracefully rather than panic.
+        _ => Equal,
+    }
+}
+
+fn cmp_keys(a: &[SortKeyValue], b: &[SortKeyValue], ascending: &[bool]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for ((av, bv), &asc) in a.iter().zip(b.iter()).zip(ascending) {
+        let ord = cmp_value(av, bv);
+        let ord = if asc { ord } else { ord.reverse() };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+fn build_keys(handle: &IndexHandle, sort: &[pb::SortClause]) -> Result<(Vec<KeyKind>, Vec<bool>)> {
+    let mut kinds = Vec::with_capacity(sort.len());
+    let mut ascending = Vec::with_capacity(sort.len());
+    for clause in sort {
+        let inner = clause
+            .clause
+            .as_ref()
+            .ok_or_else(|| ScantivyError::UnsupportedQuery("empty sort clause".into()))?;
+        let (kind, asc) = match inner {
+            pb::sort_clause::Clause::Relevance(r) => (
+                KeyKind::Score,
+                matches!(
+                    pb::SortDirection::try_from(r.direction),
+                    Ok(pb::SortDirection::SortAsc)
+                ),
+            ),
+            pb::sort_clause::Clause::IndexOrder(io) => (
+                KeyKind::IndexOrder,
+                matches!(
+                    pb::SortDirection::try_from(io.direction),
+                    Ok(pb::SortDirection::SortAsc)
+                ),
+            ),
+            pb::sort_clause::Clause::ByField(by) => {
+                let field = handle.schema.field(&by.field)?;
+                let entry = handle.schema.schema.get_field_entry(field);
+                let kind = match entry.field_type() {
+                    FieldType::I64(_) => KeyKind::I64(by.field.clone()),
+                    FieldType::U64(_) => KeyKind::U64(by.field.clone()),
+                    FieldType::F64(_) => KeyKind::F64(by.field.clone()),
+                    FieldType::Bool(_) => KeyKind::Bool(by.field.clone()),
+                    FieldType::Date(_) => KeyKind::Date(by.field.clone()),
+                    FieldType::Str(_) => KeyKind::Str(by.field.clone()),
+                    ft => {
+                        return Err(ScantivyError::UnsupportedFieldType(format!(
+                            "sort by field '{}' kind={:?} not supported in multi-sort",
+                            by.field, ft
+                        )));
+                    }
+                };
+                let asc = matches!(
+                    pb::SortDirection::try_from(by.direction),
+                    Ok(pb::SortDirection::SortAsc)
+                );
+                (kind, asc)
+            }
+        };
+        kinds.push(kind);
+        ascending.push(asc);
+    }
+    Ok((kinds, ascending))
+}
+
+pub fn multi_sort_search(
+    handle: &IndexHandle,
+    q: &dyn Query,
+    searcher: &tantivy::Searcher,
+    sort: &[pb::SortClause],
+    limit: usize,
+) -> Result<Vec<(Score, DocAddress)>> {
+    let (kinds, ascending) = build_keys(handle, sort)?;
+    let collector = MultiSortCollector {
+        kinds,
+        ascending,
+        limit,
+    };
+    let result = searcher.search(q, &collector)?;
+    Ok(result)
+}
+
+struct MultiSortCollector {
+    kinds: Vec<KeyKind>,
+    ascending: Vec<bool>,
+    limit: usize,
+}
+
+enum KeyExtractor {
+    Score,
+    IndexOrder(SegmentOrdinal),
+    I64(Column<i64>),
+    U64(Column<u64>),
+    F64(Column<f64>),
+    Bool(Column<bool>),
+    Date(Column<DateTime>),
+    Str(StrColumn),
+}
+
+struct SegMultiSortCollector {
+    extractors: Vec<KeyExtractor>,
+    ascending: Vec<bool>,
+    limit: usize,
+    segment_ord: SegmentOrdinal,
+    matches: Vec<(Vec<SortKeyValue>, DocAddress, f32)>,
+}
+
+impl Collector for MultiSortCollector {
+    type Fruit = Vec<(Score, DocAddress)>;
+    type Child = SegMultiSortCollector;
+
+    fn for_segment(
+        &self,
+        segment_local_id: SegmentOrdinal,
+        reader: &SegmentReader,
+    ) -> tantivy::Result<Self::Child> {
+        let ff = reader.fast_fields();
+        let mut extractors = Vec::with_capacity(self.kinds.len());
+        for kind in &self.kinds {
+            let ext = match kind {
+                KeyKind::Score => KeyExtractor::Score,
+                KeyKind::IndexOrder => KeyExtractor::IndexOrder(segment_local_id),
+                KeyKind::I64(name) => KeyExtractor::I64(ff.i64(name)?),
+                KeyKind::U64(name) => KeyExtractor::U64(ff.u64(name)?),
+                KeyKind::F64(name) => KeyExtractor::F64(ff.f64(name)?),
+                KeyKind::Bool(name) => KeyExtractor::Bool(ff.bool(name)?),
+                KeyKind::Date(name) => KeyExtractor::Date(ff.date(name)?),
+                KeyKind::Str(name) => {
+                    let col = ff.str(name)?.ok_or_else(|| {
+                        tantivy::TantivyError::SchemaError(format!(
+                            "field '{name}' is not a STR fast field"
+                        ))
+                    })?;
+                    KeyExtractor::Str(col)
+                }
+            };
+            extractors.push(ext);
+        }
+        Ok(SegMultiSortCollector {
+            extractors,
+            ascending: self.ascending.clone(),
+            limit: self.limit,
+            segment_ord: segment_local_id,
+            matches: Vec::new(),
+        })
+    }
+
+    fn requires_scoring(&self) -> bool {
+        self.kinds.iter().any(|k| matches!(k, KeyKind::Score))
+    }
+
+    fn merge_fruits(
+        &self,
+        segment_fruits: Vec<<Self::Child as SegmentCollector>::Fruit>,
+    ) -> tantivy::Result<Self::Fruit> {
+        let mut all: Vec<(Vec<SortKeyValue>, DocAddress, f32)> =
+            segment_fruits.into_iter().flatten().collect();
+        all.sort_by(|a, b| cmp_keys(&a.0, &b.0, &self.ascending));
+        all.truncate(self.limit);
+        Ok(all
+            .into_iter()
+            .map(|(_, addr, score)| (score, addr))
+            .collect())
+    }
+}
+
+impl SegmentCollector for SegMultiSortCollector {
+    /// Per-segment fruit carries the key tuple so `merge_fruits` can re-rank globally without
+    /// re-extracting from fast fields.
+    type Fruit = Vec<(Vec<SortKeyValue>, DocAddress, f32)>;
+
+    fn collect(&mut self, doc: DocId, score: f32) {
+        let mut key = Vec::with_capacity(self.extractors.len());
+        for ext in &self.extractors {
+            key.push(match ext {
+                KeyExtractor::Score => SortKeyValue::F32(score),
+                KeyExtractor::IndexOrder(seg) => {
+                    SortKeyValue::Pos(((*seg as u64) << 32) | doc as u64)
+                }
+                KeyExtractor::I64(c) => c
+                    .first(doc)
+                    .map(SortKeyValue::I64)
+                    .unwrap_or(SortKeyValue::None),
+                KeyExtractor::U64(c) => c
+                    .first(doc)
+                    .map(SortKeyValue::U64)
+                    .unwrap_or(SortKeyValue::None),
+                KeyExtractor::F64(c) => c
+                    .first(doc)
+                    .map(SortKeyValue::F64)
+                    .unwrap_or(SortKeyValue::None),
+                KeyExtractor::Bool(c) => c
+                    .first(doc)
+                    .map(SortKeyValue::Bool)
+                    .unwrap_or(SortKeyValue::None),
+                KeyExtractor::Date(c) => c
+                    .first(doc)
+                    .map(|dt| SortKeyValue::I64(crate::convert::millis_from_datetime(dt)))
+                    .unwrap_or(SortKeyValue::None),
+                KeyExtractor::Str(s) => match s.ords().first(doc) {
+                    Some(ord) => {
+                        let mut buf = String::new();
+                        match s.ord_to_str(ord, &mut buf) {
+                            Ok(true) => SortKeyValue::Str(buf),
+                            _ => SortKeyValue::None,
+                        }
+                    }
+                    None => SortKeyValue::None,
+                },
+            });
+        }
+        self.matches
+            .push((key, DocAddress::new(self.segment_ord, doc), score));
+    }
+
+    fn harvest(self) -> Self::Fruit {
+        // Per-segment top-N reduces the fruit shipped to merge_fruits. Sort globally there too.
+        let mut matches = self.matches;
+        matches.sort_by(|a, b| cmp_keys(&a.0, &b.0, &self.ascending));
+        matches.truncate(self.limit);
+        matches
     }
 }

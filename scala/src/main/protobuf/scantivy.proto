@@ -53,7 +53,11 @@ message FieldDef {
   bool fast = 5;            // sortable / aggregatable
   bool tokenized = 6;       // applies when kind=TEXT
   optional string analyzer = 7;
-  bool multi_valued = 8;
+  // Slot 8 was a `bool multi_valued` field that Scantivy never consulted (Tantivy treats every
+  // field as implicitly multi-valued — call `add_*` more than once and you get multiple values).
+  // Reserved so the slot can never be repurposed and silently change semantics.
+  reserved 8;
+  reserved "multi_valued";
   optional FacetOptions facet_options = 9;
 }
 
@@ -117,6 +121,13 @@ message Query {
     QueryPhrase phrase = 12;
     QueryDrillDown drill_down = 13;
     QueryBool bool_query = 14;
+    QueryExists exists = 15;
+    QueryFuzzy fuzzy = 16;
+    QueryPhrasePrefix phrase_prefix = 17;
+    QueryBoost boost = 18;
+    QueryDisjunctionMax disjunction_max = 19;
+    QueryConstScore const_score = 20;
+    QueryMoreLikeThis more_like_this = 21;
   }
 }
 
@@ -174,6 +185,65 @@ message QueryBool {
   optional uint32 min_should_match = 5;
 }
 
+// True for any doc that has at least one value in `field`.
+message QueryExists { string field = 1; }
+
+// Fuzzy / Levenshtein term match. `distance` is capped at 2 by Tantivy. When `prefix` is true, the
+// `value` is treated as a prefix and any remaining characters are matched fuzzily.
+message QueryFuzzy {
+  string field = 1;
+  string value = 2;
+  uint32 distance = 3;
+  bool transposition_cost_one = 4;
+  bool prefix = 5;
+}
+
+// Phrase whose last term matches as a prefix. Useful for as-you-type / autocomplete UX.
+message QueryPhrasePrefix {
+  string field = 1;
+  repeated string terms = 2;
+  optional uint32 max_expansions = 3;
+}
+
+// Wraps `inner` and multiplies its score by `factor`.
+message QueryBoost {
+  Query inner = 1;
+  float factor = 2;
+}
+
+// Like a `should` set but takes max(disjunct_score) + tie_breaker * sum(other_disjunct_scores)
+// instead of summing all matched disjuncts. Better for cross-field search where you don't want
+// matching in 2 fields to dominate matching strongly in 1 field.
+message QueryDisjunctionMax {
+  repeated Query disjuncts = 1;
+  optional float tie_breaker = 2;
+}
+
+// Wraps `inner` and overrides every matched doc's score with the constant `score` value.
+message QueryConstScore {
+  Query inner = 1;
+  float score = 2;
+}
+
+// "Find similar docs" using term-frequency / inverse-doc-frequency on the source doc's stored
+// fields. The source is identified by its id-field value (the schema must have `id_field` set on
+// `CreateIndexRequest`).
+message QueryMoreLikeThis {
+  string source_id = 1;
+  optional uint64 min_doc_frequency = 2;
+  optional uint64 max_doc_frequency = 3;
+  optional uint32 min_term_frequency = 4;
+  optional uint32 max_query_terms = 5;
+  optional uint32 min_word_length = 6;
+  optional uint32 max_word_length = 7;
+  optional float boost_factor = 8;
+  repeated string stop_words = 9;
+  // Whether the source doc itself should be excluded from results. Defaults to true (the typical
+  // "find similar but not the same" UX); set to false to include the source doc, which Tantivy's
+  // raw MoreLikeThis would otherwise rank at the top.
+  optional bool exclude_source = 10;
+}
+
 // =============================================================================
 // Sort
 // =============================================================================
@@ -211,6 +281,10 @@ message CreateIndexResponse {
 
 message OpenIndexRequest {
   string path = 1;
+  // The schema's `id_field` isn't persisted in the Tantivy on-disk format, so callers must re-
+  // declare it when reopening if they want upsert/delete-by-id, `MoreLikeThis`, or `explain` to
+  // work. Leave unset for read-only / search-only usage.
+  optional string id_field = 2;
 }
 
 message DropIndexRequest {
@@ -328,6 +402,21 @@ message SearchRequest {
   // For Value conversion: field name to extract.
   // For Json/Materialized: subset of fields to return.
   repeated string return_fields = 11;
+  // Optional snippet/highlight requests. Each entry produces a SnippetResult on every SearchHit.
+  repeated SnippetSpec snippets = 12;
+}
+
+message SnippetSpec {
+  string field = 1;
+  optional uint32 max_num_chars = 2;   // default 150
+  optional string pre_tag = 3;          // default "<b>"
+  optional string post_tag = 4;         // default "</b>"
+}
+
+message SnippetResult {
+  string field = 1;
+  // Tag-wrapped fragment ready to render. Empty when the doc has no usable text for this field.
+  string fragment = 2;
 }
 
 message SearchHit {
@@ -340,6 +429,7 @@ message SearchHit {
   optional float score = 10;
   // Always echoed when the index has an id_field configured.
   optional string id = 11;
+  repeated SnippetResult snippets = 12;
 }
 
 message FacetEntry {
@@ -377,6 +467,9 @@ enum AggregationType {
   AGG_HISTOGRAM = 8;
   AGG_TERMS = 9;
   AGG_CONCAT = 10;
+  AGG_DATE_HISTOGRAM = 11;
+  AGG_RANGE = 12;
+  AGG_PERCENTILES = 13;
 }
 
 message AggregationFunction {
@@ -390,6 +483,27 @@ message AggregationFunction {
   // For AGG_CONCAT: hard cap on number of matched docs whose field is concatenated. Default 1000.
   // Larger values trade memory for completeness; uncapped concat is intentionally not supported.
   optional uint32 concat_max_values = 13;
+  // For AGG_DATE_HISTOGRAM: ES-style fixed-interval string ("30s", "5m", "1h", "1d", ...).
+  optional string date_fixed_interval = 14;
+  // For AGG_DATE_HISTOGRAM: minimum doc_count for a bucket to be returned (default 0).
+  optional uint64 date_min_doc_count = 15;
+  // For AGG_DATE_HISTOGRAM: bucket-boundary offset, same syntax as fixed_interval.
+  optional string date_offset = 16;
+  // For AGG_RANGE: explicit numeric ranges. `from` is inclusive, `to` is exclusive; either can be
+  // omitted for an open-ended bucket. `key` is an optional human label.
+  repeated RangeBucketSpec range_buckets = 17;
+  // For AGG_PERCENTILES: which percentiles to compute (e.g., [50, 95, 99]). Defaults to Tantivy's
+  // standard set (1, 5, 25, 50, 75, 95, 99) when empty.
+  repeated double percentiles = 18;
+  // Sub-aggregations: only meaningful for bucket types (TERMS / HISTOGRAM / DATE_HISTOGRAM /
+  // RANGE). Each sub-agg runs once per bucket and its result is attached to the bucket.
+  repeated AggregationFunction sub_aggregations = 20;
+}
+
+message RangeBucketSpec {
+  optional string key = 1;
+  optional double from = 2;
+  optional double to = 3;
 }
 
 message AggregationRequest {
@@ -409,15 +523,41 @@ message StatsResult {
 message TermBucket {
   Value key = 1;
   uint64 doc_count = 2;
+  repeated AggregationResult sub_results = 3;
 }
 
 message HistogramBucket {
   double key = 1;
   uint64 doc_count = 2;
+  repeated AggregationResult sub_results = 3;
+}
+
+message DateHistogramBucket {
+  // Bucket boundary as millis since epoch.
+  int64 key_millis = 1;
+  uint64 doc_count = 2;
+  // ES-style ISO-8601 representation of the boundary, when Tantivy provides it.
+  optional string key_as_string = 3;
+  repeated AggregationResult sub_results = 4;
+}
+
+message RangeBucket {
+  optional string key = 1;
+  optional double from = 2;
+  optional double to = 3;
+  uint64 doc_count = 4;
+  repeated AggregationResult sub_results = 5;
 }
 
 message TermBucketList { repeated TermBucket buckets = 1; }
 message HistogramBucketList { repeated HistogramBucket buckets = 1; }
+message DateHistogramBucketList { repeated DateHistogramBucket buckets = 1; }
+message RangeBucketList { repeated RangeBucket buckets = 1; }
+
+message PercentilesResult {
+  // Percentile (as a string key like "50.0") → value.
+  map<string, double> values = 1;
+}
 
 message AggregationResult {
   string alias = 1;
@@ -427,6 +567,9 @@ message AggregationResult {
     TermBucketList terms = 4;
     HistogramBucketList histogram = 5;
     string concat = 6;
+    DateHistogramBucketList date_histogram = 7;
+    RangeBucketList range = 8;
+    PercentilesResult percentiles = 9;
   }
 }
 
@@ -451,4 +594,21 @@ message DistinctResponse {
   repeated Value values = 1;
   optional Value next_cursor = 2;
   optional string error = 3;
+}
+
+// =============================================================================
+// Explain (debug a single doc's score for a query)
+// =============================================================================
+
+message ExplainRequest {
+  string index_id = 1;
+  Query query = 2;
+  // Looked up via the schema's id_field. The first matching doc is explained.
+  string source_id = 3;
+}
+
+message ExplainResponse {
+  // Pretty-printed JSON of Tantivy's `Explanation`. Empty when no doc matched the source_id.
+  string explanation = 1;
+  optional string error = 2;
 }
