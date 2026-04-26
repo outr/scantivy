@@ -1,130 +1,110 @@
 package scantivy
 
-import jnr.ffi.{LibraryLoader, Pointer}
+import _root_.scantivy.proto as pb
 
-import java.io.{File, FileOutputStream, IOException, InputStream}
-import java.nio.file.attribute.BasicFileAttributes
-import java.nio.file.{FileVisitResult, Files, Path, SimpleFileVisitor}
+/** Handle to an open Tantivy index. Cheap to clone; thread-safe — the underlying Rust handle is
+ *  guarded by a mutex on the writer and an auto-refreshing reader.
+ *
+ *  Lifecycle:
+ *  - Created by [[Tantivy.create]] / [[Tantivy.open]].
+ *  - Closed via [[close]] (also runs on JVM shutdown via the registry's drop_index FFI).
+ */
+final class TantivyIndex private[scantivy] (val id: String) extends AutoCloseable {
 
-trait TantivyLib {
-  def create_index(path: String): Pointer
-  def add_document(index: Pointer, title: String, category: String): Pointer
-  def search(index: Pointer, query: String, facet: String): Pointer
-  def free_string(ptr: Pointer): Unit
-}
+  // ---- write ops ----------------------------------------------------------------------------
 
-object TantivyIndex {
-  NativeLibLoader.extractLibrary() // ✅ Extract and load native library automatically
-  private val tantivy = LibraryLoader.create(classOf[TantivyLib]).load("scantivy")
+  def index(doc: pb.Document): Either[String, Unit] =
+    Ffi.call(pb.IndexDocumentRequest(indexId = id, document = Some(doc)), TantivyLib.indexDocument)(
+      pb.GenericResponse.parseFrom
+    ).flatMap(unitOrError)
 
-  def create(path: Option[Path] = None): TantivyIndex = {
-    path.foreach { p =>
-      Files.createDirectories(p)
-    }
-    val indexPtr = path match {
-      case Some(path) => tantivy.create_index(path.toAbsolutePath.toString)
-      case None => tantivy.create_index(null) // In-memory index
-    }
-    new TantivyIndex(indexPtr)
-  }
-}
+  def indexBatch(docs: Seq[pb.Document]): Either[String, Unit] =
+    Ffi.call(pb.IndexDocumentsRequest(indexId = id, documents = docs), TantivyLib.indexDocuments)(
+      pb.GenericResponse.parseFrom
+    ).flatMap(unitOrError)
 
-class TantivyIndex(private val indexPtr: Pointer) {
-  def addDocument(title: String, category: FacetTree): Unit = {
-    val categoryString = category.toTantivyPath
-    val resultPtr = TantivyIndex.tantivy.add_document(indexPtr, title, categoryString)
-    TantivyIndex.tantivy.free_string(resultPtr)
-  }
+  def upsert(idValue: pb.Value, doc: pb.Document, idFieldOverride: Option[String] = None): Either[String, Unit] =
+    Ffi.call(
+      pb.UpsertDocumentRequest(
+        indexId = id,
+        idFieldOverride = idFieldOverride,
+        idValue = Some(idValue),
+        document = Some(doc)
+      ),
+      TantivyLib.upsertDocument
+    )(pb.GenericResponse.parseFrom).flatMap(unitOrError)
 
-  def search(query: Option[String] = None, facet: Option[FacetTree] = None): Seq[String] = {
-    val queryStr = query.orNull
-    val facetStr = facet.map(_.toTantivyPath).orNull
+  def delete(idValue: pb.Value, idFieldOverride: Option[String] = None): Either[String, Unit] =
+    Ffi.call(
+      pb.DeleteRequest(indexId = id, idFieldOverride = idFieldOverride, idValue = Some(idValue)),
+      TantivyLib.deleteDocument
+    )(pb.GenericResponse.parseFrom).flatMap(unitOrError)
 
-    val resultPtr = TantivyIndex.tantivy.search(indexPtr, queryStr, facetStr)
-    val results = resultPtr.getString(0).split("\n").toSeq
-    TantivyIndex.tantivy.free_string(resultPtr)
-    results
-  }
-}
+  def deleteByQuery(query: pb.Query): Either[String, Long] =
+    Ffi.call(pb.DeleteByQueryRequest(indexId = id, query = Some(query)), TantivyLib.deleteByQuery)(
+      pb.DeleteByQueryResponse.parseFrom
+    ).flatMap(r => r.error.toLeft(r.deletedEstimate.getOrElse(0L)))
 
-case class FacetTree(levels: List[String]) {
-  def toTantivyPath: String = "/" + levels.mkString("/")
-}
+  def truncate(): Either[String, Unit] =
+    Ffi.call(pb.TruncateRequest(indexId = id), TantivyLib.truncate)(pb.GenericResponse.parseFrom)
+      .flatMap(unitOrError)
 
-object TantivyExample {
-  def main(args: Array[String]): Unit = {
-    val dir = Path.of("test_index")
-    // Create an index (in-memory or on-disk)
-    val index = TantivyIndex.create(Some(dir)) // Use None for in-memory
+  def optimize(maxSegments: Int = 1): Either[String, Unit] =
+    Ffi.call(pb.OptimizeRequest(indexId = id, maxSegments = maxSegments), TantivyLib.optimize)(
+      pb.GenericResponse.parseFrom
+    ).flatMap(unitOrError)
 
-    // Add documents with hierarchical facets
-    index.addDocument("iPhone 13", FacetTree(List("electronics", "phones")))
-    index.addDocument("MacBook Pro", FacetTree(List("electronics", "laptops")))
-    index.addDocument("Samsung Galaxy S22", FacetTree(List("electronics", "phones")))
+  def commit(): Either[String, Long] =
+    Ffi.call(pb.CommitRequest(indexId = id), TantivyLib.commit)(pb.CommitResponse.parseFrom)
+      .flatMap(r => r.error.toLeft(r.opstamp.getOrElse(0L)))
 
-    // Search with only a text query
-    val results1 = index.search(Some("iPhone"), None)
-    println(s"Search Results (Text only):\n${results1.mkString("\n")}")
+  def rollback(): Either[String, Unit] =
+    Ffi.call(pb.RollbackRequest(indexId = id), TantivyLib.rollback)(pb.GenericResponse.parseFrom)
+      .flatMap(unitOrError)
 
-    // Search with only a facet filter
-    val results2 = index.search(None, Some(FacetTree(List("electronics", "phones"))))
-    println(s"Search Results (Facet only):\n${results2.mkString("\n")}")
+  // ---- read ops -----------------------------------------------------------------------------
 
-    // Search with both a text query and a facet filter
-    val results3 = index.search(Some("iPhone"), Some(FacetTree(List("electronics", "phones"))))
-    println(s"Search Results (Text + Facet):\n${results3.mkString("\n")}")
+  def count(query: pb.Query): Either[String, Long] =
+    Ffi.call(pb.CountRequest(indexId = id, query = Some(query)), TantivyLib.count)(pb.CountResponse.parseFrom)
+      .flatMap(r => r.error.toLeft(r.count.getOrElse(0L)))
 
-    // Search with neither (returns all documents)
-    val results4 = index.search()
-    println(s"All Documents:\n${results4.mkString("\n")}")
-
-    deleteDirectory(dir)
-  }
-
-  def deleteDirectory(dir: Path): Unit = {
-    if (Files.exists(dir)) {
-      Files.walkFileTree(dir, new SimpleFileVisitor[Path] {
-        override def visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult = {
-          Files.delete(file)
-          super.visitFile(file, attrs)
-        }
-        override def postVisitDirectory(dir: Path, exc: IOException): FileVisitResult = {
-          Files.delete(dir)
-          super.postVisitDirectory(dir, exc)
-        }
+  def search(request: pb.SearchRequest): Either[String, pb.SearchResponse] = {
+    val withId = if request.indexId.isEmpty then request.copy(indexId = id) else request
+    Ffi.call(withId, TantivyLib.search)(pb.SearchResponse.parseFrom)
+      .flatMap(r => r.error match {
+        case Some(e) => Left(e)
+        case None => Right(r)
       })
-    }
   }
-}
 
-object NativeLibLoader {
-  def extractLibrary(): Unit = {
-    val libName = System.getProperty("os.name").toLowerCase match {
-      case os if os.contains("win") => "scantivy.dll"
-      case os if os.contains("mac") => System.getProperty("os.arch") match {
-        case arch if arch.contains("aarch64") || arch.contains("arm64") => "libscantivy-aarch64.dylib"
-        case _ => "libscantivy-x86_64.dylib"
-      }
-      case _ => "libscantivy.so"
-    }
-
-    val tempFile = new File(System.getProperty("java.io.tmpdir"), libName)
-    if (!tempFile.exists()) {
-      val in: InputStream = getClass.getResourceAsStream(s"/native/$libName")
-      if (in == null) throw new RuntimeException(s"Native library $libName not found in resources")
-
-      val out = new FileOutputStream(tempFile)
-      val buffer = new Array[Byte](1024)
-      var bytesRead = in.read(buffer)
-      while (bytesRead != -1) {
-        out.write(buffer, 0, bytesRead)
-        bytesRead = in.read(buffer)
-      }
-      in.close()
-      out.close()
-      tempFile.setExecutable(true)
-    }
-
-    System.load(tempFile.getAbsolutePath) // Load the extracted native library
+  def aggregate(request: pb.AggregationRequest): Either[String, pb.AggregationResponse] = {
+    val withId = if request.indexId.isEmpty then request.copy(indexId = id) else request
+    Ffi.call(withId, TantivyLib.aggregate)(pb.AggregationResponse.parseFrom)
+      .flatMap(r => r.error match {
+        case Some(e) => Left(e)
+        case None => Right(r)
+      })
   }
+
+  /** Single-page distinct call. Higher-level streaming should chain this until `nextCursor` is empty. */
+  def distinctPage(request: pb.DistinctRequest): Either[String, pb.DistinctResponse] = {
+    val withId = if request.indexId.isEmpty then request.copy(indexId = id) else request
+    Ffi.call(withId, TantivyLib.distinct)(pb.DistinctResponse.parseFrom)
+      .flatMap(r => r.error match {
+        case Some(e) => Left(e)
+        case None => Right(r)
+      })
+  }
+
+  override def close(): Unit = {
+    val req = pb.DropIndexRequest(indexId = id)
+    Ffi.call(req, TantivyLib.dropIndex)(pb.GenericResponse.parseFrom)
+    ()
+  }
+
+  private def unitOrError(r: pb.GenericResponse): Either[String, Unit] =
+    r.error match {
+      case Some(e) => Left(e)
+      case None => Right(())
+    }
 }

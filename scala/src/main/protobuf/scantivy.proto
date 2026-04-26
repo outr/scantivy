@@ -1,0 +1,454 @@
+// IMPORTANT: keep in sync with rust/proto/scantivy.proto. The only differences are the scalapb
+// import + flat_package option below, which are Scala-only.
+
+syntax = "proto3";
+
+import "scalapb/scalapb.proto";
+
+package scantivy.proto;
+
+option java_multiple_files = true;
+option (scalapb.options) = {
+  flat_package: true
+};
+
+// =============================================================================
+// Common
+// =============================================================================
+
+enum SortDirection {
+  SORT_ASC = 0;
+  SORT_DESC = 1;
+}
+
+// =============================================================================
+// Schema
+// =============================================================================
+
+enum FieldKind {
+  FIELD_KIND_UNSPECIFIED = 0;
+  TEXT = 1;     // tokenized — uses analyzer
+  STRING = 2;   // raw, single-token
+  BOOL = 3;
+  I64 = 4;
+  U64 = 5;
+  F64 = 6;
+  DATE = 7;     // millis since epoch
+  BYTES = 8;
+  FACET = 9;
+  JSON_FIELD = 10;
+  IP = 11;
+}
+
+message FacetOptions {
+  bool hierarchical = 1;
+  bool require_dim_count = 2;
+}
+
+message FieldDef {
+  string name = 1;
+  FieldKind kind = 2;
+  bool stored = 3;
+  bool indexed = 4;
+  bool fast = 5;            // sortable / aggregatable
+  bool tokenized = 6;       // applies when kind=TEXT
+  optional string analyzer = 7;
+  bool multi_valued = 8;
+  optional FacetOptions facet_options = 9;
+}
+
+message SchemaDef {
+  repeated FieldDef fields = 1;
+}
+
+// =============================================================================
+// Values & documents
+// =============================================================================
+
+message GeoPoint { double latitude = 1; double longitude = 2; }
+
+message JsonValue {
+  // Raw JSON bytes. Treated opaquely on the Rust side except for `JsonField` schema entries,
+  // which decode the bytes into a JSON object before indexing.
+  bytes encoded = 1;
+}
+
+message Value {
+  oneof kind {
+    string string_value = 1;
+    int64 long_value = 2;
+    uint64 ulong_value = 3;
+    double double_value = 4;
+    bool bool_value = 5;
+    string facet_value = 6;
+    int64 date_millis = 7;
+    bytes bytes_value = 8;
+    string ip_value = 9;
+    JsonValue json_value = 10;
+  }
+}
+
+message FieldValue {
+  string name = 1;
+  repeated Value values = 2;  // single-valued fields use one entry
+}
+
+message Document {
+  repeated FieldValue fields = 1;
+}
+
+// =============================================================================
+// Query AST
+// =============================================================================
+
+message Query {
+  oneof node {
+    QueryAll all = 1;
+    QueryNone none = 2;
+    QueryTerm term = 3;
+    QueryRange range = 4;
+    QueryIn in_set = 5;
+    QueryStartsWith starts_with = 6;
+    QueryEndsWith ends_with = 7;
+    QueryContains contains = 8;
+    QueryRegex regex = 9;
+    QueryExact exact = 10;
+    QueryFullText full_text = 11;
+    QueryPhrase phrase = 12;
+    QueryDrillDown drill_down = 13;
+    QueryBool bool_query = 14;
+  }
+}
+
+message QueryAll {}
+message QueryNone {}
+
+message QueryTerm {
+  string field = 1;
+  Value value = 2;
+}
+
+message QueryRange {
+  string field = 1;
+  optional Value gte = 2;
+  optional Value lte = 3;
+  optional Value gt = 4;
+  optional Value lt = 5;
+}
+
+message QueryIn {
+  string field = 1;
+  repeated Value values = 2;
+}
+
+message QueryStartsWith { string field = 1; string value = 2; }
+message QueryEndsWith   { string field = 1; string value = 2; }
+message QueryContains   { string field = 1; string value = 2; }
+message QueryRegex      { string field = 1; string pattern = 2; }
+message QueryExact      { string field = 1; string value = 2; }
+
+message QueryFullText {
+  // Uses Tantivy's QueryParser across the configured text fields.
+  // If `fields` is empty, defaults to all TEXT fields in the schema.
+  string query = 1;
+  repeated string fields = 2;
+}
+
+message QueryPhrase {
+  string field = 1;
+  repeated string terms = 2;
+  uint32 slop = 3;
+}
+
+message QueryDrillDown {
+  string field = 1;
+  repeated string path = 2;
+  bool only_this_level = 3;
+}
+
+message QueryBool {
+  repeated Query must = 1;
+  repeated Query should = 2;
+  repeated Query must_not = 3;
+  repeated Query filter = 4;
+  optional uint32 min_should_match = 5;
+}
+
+// =============================================================================
+// Sort
+// =============================================================================
+
+message SortRelevance  { SortDirection direction = 1; }
+message SortIndexOrder { SortDirection direction = 1; }
+message SortByField    { string field = 1; SortDirection direction = 2; }
+
+message SortClause {
+  oneof clause {
+    SortRelevance relevance = 1;
+    SortIndexOrder index_order = 2;
+    SortByField by_field = 3;
+  }
+}
+
+// =============================================================================
+// Index lifecycle
+// =============================================================================
+
+message CreateIndexRequest {
+  // If unset, an in-memory index is created.
+  optional string path = 1;
+  SchemaDef schema = 2;
+  // Field name that uniquely identifies a document (used for upsert/delete by id).
+  optional string id_field = 3;
+  // IndexWriter heap budget in bytes (default 50 MB).
+  optional uint64 writer_heap_bytes = 4;
+}
+
+message CreateIndexResponse {
+  optional string index_id = 1;
+  optional string error = 2;
+}
+
+message OpenIndexRequest {
+  string path = 1;
+}
+
+message DropIndexRequest {
+  string index_id = 1;
+}
+
+message GenericResponse {
+  optional string error = 1;
+}
+
+// =============================================================================
+// Write ops
+// =============================================================================
+
+message IndexDocumentRequest {
+  string index_id = 1;
+  Document document = 2;
+}
+
+message IndexDocumentsRequest {
+  string index_id = 1;
+  repeated Document documents = 2;
+}
+
+message UpsertDocumentRequest {
+  string index_id = 1;
+  // Defaults to the schema's configured id_field.
+  optional string id_field_override = 2;
+  Value id_value = 3;
+  Document document = 4;
+}
+
+message DeleteRequest {
+  string index_id = 1;
+  optional string id_field_override = 2;
+  Value id_value = 3;
+}
+
+message DeleteByQueryRequest {
+  string index_id = 1;
+  Query query = 2;
+}
+
+message DeleteByQueryResponse {
+  optional uint64 deleted_estimate = 1;
+  optional string error = 2;
+}
+
+message TruncateRequest {
+  string index_id = 1;
+}
+
+message OptimizeRequest {
+  string index_id = 1;
+  uint32 max_segments = 2;  // 0 → default (1)
+}
+
+message CommitRequest {
+  string index_id = 1;
+}
+
+message CommitResponse {
+  optional uint64 opstamp = 1;
+  optional string error = 2;
+}
+
+message RollbackRequest {
+  string index_id = 1;
+}
+
+// =============================================================================
+// Count
+// =============================================================================
+
+message CountRequest {
+  string index_id = 1;
+  Query query = 2;
+}
+
+message CountResponse {
+  optional uint64 count = 1;
+  optional string error = 2;
+}
+
+// =============================================================================
+// Search
+// =============================================================================
+
+enum ConversionMode {
+  CONVERSION_DOC = 0;            // full stored doc
+  CONVERSION_VALUE = 1;          // single field value per hit
+  CONVERSION_JSON = 2;           // selected fields encoded as JsonValue
+  CONVERSION_MATERIALIZED = 3;   // selected indexed fields as Document
+  CONVERSION_DOC_AND_INDEXES = 4;
+}
+
+message FacetRequest {
+  string field = 1;
+  repeated string path = 2;
+  optional uint32 children_limit = 3;
+  optional uint32 dims_limit = 4;
+}
+
+message SearchRequest {
+  string index_id = 1;
+  Query query = 2;
+  repeated SortClause sort = 3;
+  uint32 offset = 4;
+  uint32 limit = 5;
+  bool count_total = 6;
+  bool score_docs = 7;
+  optional double min_doc_score = 8;
+  repeated FacetRequest facets = 9;
+  ConversionMode conversion = 10;
+  // For Value conversion: field name to extract.
+  // For Json/Materialized: subset of fields to return.
+  repeated string return_fields = 11;
+}
+
+message SearchHit {
+  oneof payload {
+    Document doc = 1;
+    Value value = 2;
+    JsonValue json = 3;
+    Document materialized = 4;
+  }
+  optional float score = 10;
+  // Always echoed when the index has an id_field configured.
+  optional string id = 11;
+}
+
+message FacetEntry {
+  string label = 1;
+  uint32 count = 2;
+}
+
+message FacetResult {
+  string field = 1;
+  repeated FacetEntry entries = 2;
+  uint32 total_count = 3;
+  uint32 child_count = 4;
+}
+
+message SearchResponse {
+  repeated SearchHit hits = 1;
+  optional uint64 total = 2;
+  repeated FacetResult facets = 3;
+  optional string error = 4;
+}
+
+// =============================================================================
+// Aggregation
+// =============================================================================
+
+enum AggregationType {
+  AGG_UNSPECIFIED = 0;
+  AGG_SUM = 1;
+  AGG_AVG = 2;
+  AGG_MIN = 3;
+  AGG_MAX = 4;
+  AGG_COUNT = 5;
+  AGG_STATS = 6;
+  AGG_CARDINALITY = 7;
+  AGG_HISTOGRAM = 8;
+  AGG_TERMS = 9;
+  AGG_CONCAT = 10;
+}
+
+message AggregationFunction {
+  string alias = 1;
+  string field = 2;
+  AggregationType type = 3;
+  optional double histogram_interval = 10;
+  optional uint32 terms_size = 11;
+  // For AGG_CONCAT: separator between joined values (default ", ").
+  optional string concat_separator = 12;
+  // For AGG_CONCAT: hard cap on number of matched docs whose field is concatenated. Default 1000.
+  // Larger values trade memory for completeness; uncapped concat is intentionally not supported.
+  optional uint32 concat_max_values = 13;
+}
+
+message AggregationRequest {
+  string index_id = 1;
+  optional Query filter_query = 2;
+  repeated AggregationFunction functions = 3;
+}
+
+message StatsResult {
+  uint64 count = 1;
+  double sum = 2;
+  double min = 3;
+  double max = 4;
+  double avg = 5;
+}
+
+message TermBucket {
+  Value key = 1;
+  uint64 doc_count = 2;
+}
+
+message HistogramBucket {
+  double key = 1;
+  uint64 doc_count = 2;
+}
+
+message TermBucketList { repeated TermBucket buckets = 1; }
+message HistogramBucketList { repeated HistogramBucket buckets = 1; }
+
+message AggregationResult {
+  string alias = 1;
+  oneof value {
+    double numeric = 2;
+    StatsResult stats = 3;
+    TermBucketList terms = 4;
+    HistogramBucketList histogram = 5;
+    string concat = 6;
+  }
+}
+
+message AggregationResponse {
+  repeated AggregationResult results = 1;
+  optional string error = 2;
+}
+
+// =============================================================================
+// Distinct (composite-cursor paging)
+// =============================================================================
+
+message DistinctRequest {
+  string index_id = 1;
+  optional Query filter_query = 2;
+  string field = 3;
+  uint32 page_size = 4;
+  optional Value cursor = 5;  // last value from previous page (exclusive)
+}
+
+message DistinctResponse {
+  repeated Value values = 1;
+  optional Value next_cursor = 2;
+  optional string error = 3;
+}
